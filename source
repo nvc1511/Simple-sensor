@@ -1,0 +1,285 @@
+/*
+ =====================================================================
+  BAO CHAY / BAO RUNG CHAN PHONG NGU - ESP32 - BAN DON GIAN
+  MUC TIEU SO 1: co KHOI hoac NHIET DO CAO BAT THUONG -> HU TO DE DANH THUC NGUOI DANG NGU
+ =====================================================================
+
+ NGUYEN TAC (rat don gian, de giai thich va de mo phong):
+   - Bat ky dau hieu nao sau day (keo dai ~1.5 giay) -> BAO DONG CHAY ngay (coi huu + den do + rung):
+        * Khoi/gas (MQ-2) vuot SMOKE_ALARM_ADC
+        * Nhiet do (BME280) >= TEMP_ALARM_C, hoac tang >= TEMP_RISE_ALARM_C trong ~30 giay
+        * Co lua (KY-026)
+   - KHONG can nhieu cam bien dong y moi bao
+     Giam bao gia bang: phai duy tri ~1.5 giay, va co thoi gian "warm-up" cho MQ-2 khi moi bat may.
+   - Rung chan (ADXL345) la mot kieu bao dong rieng (bip nhanh), dung thuat toan STA/LTA.
+   - Muc "TIEN CANH BAO" (den vang, bip nhe) khi khoi/nhiet do bat dau tang.
+
+ THU VIEN: "Adafruit BME280 Library" (keo theo "Adafruit Unified Sensor"). ADXL345 doc truc tiep, khong can thu vien.
+
+ DAU DAY (ten chan Wokwi trong ngoac)
+   ADXL345  VCC->3V3  GND->GND  SDA->GPIO21(D21)  SCL->GPIO22(D22)
+            (mach that: CS->3V3, SDO->GND; neu Wokwi khong co ADXL345 dung MPU6050 va doi ACCEL_TYPE = 1)
+   BME280   VCC->3V3  GND->GND  SDA->GPIO21        SCL->GPIO22     (dung chung bus voi ADXL345)
+   MQ-2     VCC->3V3 (Wokwi) hoac 5V (mach that, kem chia ap)  GND->GND  AO->GPIO34(D34)
+            (mach that: AO -> 10k -> GPIO34 -> 20k -> GND)
+   KY-026   VCC->3V3  GND->GND  DO->GPIO33(D33)
+   Buzzer   (+)->GPIO25(D25)  (-)->GND
+   LED xanh GPIO26 -> 220 ohm -> LED -> GND
+   LED vang GPIO27 -> 220 ohm -> LED -> GND
+   LED do   GPIO13 -> 220 ohm -> LED -> GND
+   Rung (tuy chon)  GPIO32 -> (Wokwi: 220 ohm + LED, mach that: transistor + mo-to rung de duoi goi)
+   Nut bam  GPIO4 <-> GND
+
+ CACH CHINH NGUONG: mo Serial Monitor (115200). Moi 1 giay in ra MQ=<so doc ADC>, T=<nhiet do>.
+   Keo cam bien MQ-2 (Wokwi) o muc "binh thuong" -> ghi lai so MQ, roi dat SMOKE_WARN_ADC cao hon mot chut
+   va SMOKE_ALARM_ADC cao hon nua. Mach that: moi con MQ-2 mot kieu, phai tu do va chinh.
+
+ THU MAY: giu nut >= 2 giay -> chay thu 3 kieu (tien canh bao, rung chan, chay). Bam ngan = tat tieng 30 giay
+          (het 30 giay ma van nguy hiem thi coi hu lai).
+ =====================================================================
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+
+// ============================ CAU HINH ===============================
+#define DEMO_MODE   1     // 1 = mo phong (warm-up ngan); 0 = mach that (warm-up MQ-2 60 giay)
+#define ACCEL_TYPE  1     // 0 = ADXL345, 1 = MPU6050
+
+constexpr int PIN_SDA = 21, PIN_SCL = 22;
+constexpr int PIN_MQ2 = 34, PIN_FLAME = 33;
+constexpr int PIN_BUZZER = 25, PIN_VIB = 32;
+constexpr int PIN_LED_G = 26, PIN_LED_Y = 27, PIN_LED_R = 13;
+constexpr int PIN_BTN = 4;
+
+// --- Nguong chay (CHINH THEO CAM BIEN CUA NHOM) ---
+constexpr int   SMOKE_WARN_ADC  = 2600;   // 0..4095: tien canh bao
+constexpr int   SMOKE_ALARM_ADC = 3200;   // BAO DONG
+constexpr float TEMP_WARN_C        = 42.0f;
+constexpr float TEMP_ALARM_C       = 50.0f;
+constexpr float TEMP_RISE_ALARM_C  = 5.0f;   // tang >= 5 do C trong ~30 giay
+constexpr uint32_t CONFIRM_MS = 1500;     // dau hieu phai keo dai chung nay moi bao dong
+constexpr uint32_t CLEAR_MS   = 2000;    // het dau hieu van giu bao dong them 10 giay
+constexpr uint32_t MUTE_MS    = 30000;
+#if DEMO_MODE
+constexpr uint32_t MQ_WARMUP_MS = 3000;
+#else
+constexpr uint32_t MQ_WARMUP_MS = 60000;
+#endif
+
+// --- Rung chan (STA/LTA) ---
+constexpr float QUAKE_MIN_STA_G = 0.05f;
+constexpr float QUAKE_RATIO     = 3.0f;
+constexpr uint8_t QUAKE_SUSTAIN = 25;         // ~0.5 giay lien tuc
+constexpr uint32_t QUAKE_HOLD_MS = 2000;
+
+// ============================ BIEN TOAN CUC ===========================
+enum State : uint8_t { S_OK = 0, S_WARN = 1, S_QUAKE = 2, S_FIRE = 3 };
+
+Adafruit_BME280 bme;
+bool haveBME = false, haveAccel = false;
+
+struct Ring {
+  float v[16]; uint8_t cap = 15, n = 0, head = 0;
+  void push(float x) { v[head] = x; head = (head + 1) % cap; if (n < cap) n++; }
+  bool full() const { return n == cap; }
+  float oldest() const { return full() ? v[head] : v[0]; }
+} tempHist;
+
+float tempC = NAN, hum = NAN, pressHpa = NAN, tempRise = 0;
+int   mqRaw = 0;
+bool  flameNow = false; int flameIdle = HIGH; uint32_t flameSince = 0;
+
+float bx = 0, by = 0, bz = 1.0f, sta = 0, lta = 0.005f;   // bx,by,bz: gia toc luc yen tren tung truc (g)
+uint8_t quakeCount = 0; uint32_t quakeUntil = 0;
+uint32_t fireSince = 0, fireUntil = 0;
+State state = S_OK;
+
+uint32_t muteUntil = 0, btnStart = 0, testStart = 0; bool btnDown = false, testing = false;
+String why = "";
+
+// ============================== I2C ==================================
+void writeReg(uint8_t a, uint8_t r, uint8_t v) { Wire.beginTransmission(a); Wire.write(r); Wire.write(v); Wire.endTransmission(); }
+bool readBytes(uint8_t a, uint8_t r, uint8_t* b, uint8_t n) {
+  Wire.beginTransmission(a); Wire.write(r);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(a, n) != n) return false;
+  for (uint8_t i = 0; i < n; i++) b[i] = Wire.read();
+  return true;
+}
+bool accelBegin() {
+#if ACCEL_TYPE == 0
+  uint8_t id = 0;
+  if (!readBytes(0x53, 0x00, &id, 1) || id != 0xE5) return false;
+  writeReg(0x53, 0x2C, 0x0A); writeReg(0x53, 0x31, 0x08); writeReg(0x53, 0x2D, 0x08);
+  return true;
+#else
+  Wire.beginTransmission(0x68); if (Wire.endTransmission() != 0) return false;
+  writeReg(0x68, 0x6B, 0x00); writeReg(0x68, 0x1C, 0x00); return true;
+#endif
+}
+bool accelRead(float& x, float& y, float& z) {
+  uint8_t b[6];
+#if ACCEL_TYPE == 0
+  if (!readBytes(0x53, 0x32, b, 6)) return false;
+  x = (int16_t)(b[0] | (b[1] << 8)) * 0.0039f; y = (int16_t)(b[2] | (b[3] << 8)) * 0.0039f; z = (int16_t)(b[4] | (b[5] << 8)) * 0.0039f;
+#else
+  if (!readBytes(0x68, 0x3B, b, 6)) return false;
+  x = (int16_t)((b[0] << 8) | b[1]) / 16384.0f; y = (int16_t)((b[2] << 8) | b[3]) / 16384.0f; z = (int16_t)((b[4] << 8) | b[5]) / 16384.0f;
+#endif
+  return true;
+}
+
+// ============================= BUZZER ================================
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+void buzzerInit()         { ledcAttach(PIN_BUZZER, 2000, 8); ledcWriteTone(PIN_BUZZER, 0); }
+void buzzerTone(int f)    { ledcWriteTone(PIN_BUZZER, f); }
+#else
+void buzzerInit()         { ledcSetup(0, 2000, 8); ledcAttachPin(PIN_BUZZER, 0); ledcWriteTone(0, 0); }
+void buzzerTone(int f)    { ledcWriteTone(0, f); }
+#endif
+
+// ========================== DOC CAM BIEN =============================
+void quakeTick(uint32_t now) {                // 50 Hz
+  float x, y, z; if (!accelRead(x, y, z)) return;
+  bool active = now < quakeUntil;
+  if (!active) {                              // moc tung truc tu bu cham (~10 giay)
+    bx += (x - bx) * 0.002f; by += (y - by) * 0.002f; bz += (z - bz) * 0.002f;
+  }
+  // Rung dong = do lech cua vec-to gia toc so voi luc yen (nhay ca rung ngang lan rung doc)
+  float dx = x - bx, dy = y - by, dz = z - bz;
+  float dyn = sqrtf(dx * dx + dy * dy + dz * dz);
+  sta += (dyn - sta) / 25.0f;
+  if (!active) lta += (dyn - lta) / 500.0f;
+  if (lta < 0.005f) lta = 0.005f;
+  bool over = (sta > QUAKE_MIN_STA_G && sta / lta > QUAKE_RATIO);
+  if (over) { if (quakeCount < 255) quakeCount++; } else quakeCount = 0;
+  if (quakeCount >= QUAKE_SUSTAIN) quakeUntil = now + QUAKE_HOLD_MS;
+}
+
+void flameTick(uint32_t now) {                // 20 Hz, loc 300 ms
+  if (digitalRead(PIN_FLAME) != flameIdle) { if (!flameSince) flameSince = now; flameNow = (now - flameSince >= 300); }
+  else { flameSince = 0; flameNow = false; }
+}
+
+void mqTick() {                               // 5 Hz, trung binh 8 lan
+  long s = 0; for (int i = 0; i < 8; i++) s += analogRead(PIN_MQ2);
+  mqRaw = s / 8;
+}
+
+uint32_t lastTempSample = 0;
+void bmeTick(uint32_t now) {                  // 1 Hz
+  if (!haveBME) return;
+  float t = bme.readTemperature(), h = bme.readHumidity(), p = bme.readPressure() / 100.0f;
+  if (isnan(t)) return;
+  tempC = t; hum = h; pressHpa = p;
+  if (tempHist.n == 0 || now - lastTempSample >= 2000) {      // 15 mau x 2 giay ~ 30 giay
+    lastTempSample = now; tempHist.push(t);
+    tempRise = tempHist.full() ? (t - tempHist.oldest()) : 0;
+  }
+}
+
+// ======================= QUYET DINH TRANG THAI =======================
+void decide(uint32_t now) {
+  why = "";
+  bool mqValid  = now >= MQ_WARMUP_MS;
+  bool smokeAl  = mqValid && mqRaw >= SMOKE_ALARM_ADC;
+  bool smokeWn  = mqValid && mqRaw >= SMOKE_WARN_ADC;
+  bool tempAl   = haveBME && !isnan(tempC) && (tempC >= TEMP_ALARM_C || tempRise >= TEMP_RISE_ALARM_C);
+  bool tempWn   = haveBME && !isnan(tempC) && tempC >= TEMP_WARN_C;
+
+  bool fireCond = smokeAl || tempAl || flameNow;
+  if (fireCond) {
+    if (!fireSince) fireSince = now;
+    if (now - fireSince >= CONFIRM_MS) fireUntil = now + CLEAR_MS;   // xac nhan -> giu bao dong
+  } else fireSince = 0;
+
+  if (smokeAl) why += "KHOI/GAS-CAO ";
+  if (tempAl)  why += "NHIET-CAO ";
+  if (flameNow) why += "LUA ";
+
+  if (now < fireUntil)        state = S_FIRE;
+  else if (now < quakeUntil)  { state = S_QUAKE; why += "RUNG-CHAN "; }
+  else if (smokeWn || tempWn) { state = S_WARN;  why += "TIEN-CANH-BAO "; }
+  else                        state = S_OK;
+}
+
+// ============================== DAU RA ===============================
+void outputs(State st, uint32_t now) {
+  if (testing) {
+    uint32_t el = now - testStart;
+    if (el >= 4500) testing = false;
+    else st = (el < 1500) ? S_WARN : (el < 3000 ? S_QUAKE : S_FIRE);
+  }
+  bool g = false, y = false, r = false, vib = false; int freq = 0;
+  switch (st) {
+    case S_OK:    g = true; break;
+    case S_WARN:  y = true; if ((now % 5000) < 150) freq = 2000; break;                       // bip nhe moi 5 giay
+    case S_QUAKE: r = (now % 330) < 165; if ((now % 200) < 100) freq = 2800; vib = true; break; // bip nhanh
+    case S_FIRE:  r = (now % 250) < 125; freq = 1500 + (int)(now % 1000) * 2; vib = true; break; // coi huu quet 1.5-3.5 kHz
+  }
+  if (!testing && now < muteUntil) freq = 0;
+  digitalWrite(PIN_LED_G, g); digitalWrite(PIN_LED_Y, y); digitalWrite(PIN_LED_R, r);
+  digitalWrite(PIN_VIB, vib);
+  buzzerTone(freq);
+}
+
+void buttonTick(uint32_t now) {
+  bool down = digitalRead(PIN_BTN) == LOW;
+  if (down && !btnDown) { btnDown = true; btnStart = now; }
+  if (!down && btnDown) {
+    btnDown = false; uint32_t held = now - btnStart;
+    if (held >= 2000)    { testing = true; testStart = now; Serial.println(">> THU MAY"); }
+    else if (held >= 50) { muteUntil = now + MUTE_MS; Serial.println(">> TAT TIENG 30 GIAY"); }
+  }
+}
+
+// ============================== SETUP ================================
+void setup() {
+  Serial.begin(115200); delay(300);
+  Serial.println("\n=== BAO CHAY / RUNG CHAN PHONG NGU v2 ===");
+  pinMode(PIN_LED_G, OUTPUT); pinMode(PIN_LED_Y, OUTPUT); pinMode(PIN_LED_R, OUTPUT); pinMode(PIN_VIB, OUTPUT);
+  pinMode(PIN_BTN, INPUT_PULLUP); pinMode(PIN_FLAME, INPUT);
+  buzzerInit(); analogReadResolution(12);
+
+  Wire.begin(PIN_SDA, PIN_SCL); Wire.setClock(400000);
+
+  haveAccel = accelBegin();
+  if (haveAccel) {
+    float sx = 0, sy = 0, sz = 0; int n = 0;      // de yen thiet bi ~1 giay de lay moc tung truc
+    for (int i = 0; i < 50; i++) { float x, y, z; if (accelRead(x, y, z)) { sx += x; sy += y; sz += z; n++; } delay(20); }
+    if (n) { bx = sx / n; by = sy / n; bz = sz / n; }
+    Serial.println("Gia toc ke: OK");
+  } else Serial.println("LOI: khong thay gia toc ke -> tat bao rung chan");
+
+  haveBME = bme.begin(0x76) || bme.begin(0x77);
+  Serial.println(haveBME ? "BME280: OK" : "LOI: khong thay BME280 -> tat bao nhiet do");
+
+  delay(300); flameIdle = digitalRead(PIN_FLAME);
+  Serial.printf("KY-026: muc luc khong co lua = %d (luc bat may phai chua co lua)\n", flameIdle);
+
+  digitalWrite(PIN_LED_G, HIGH); digitalWrite(PIN_LED_Y, HIGH); digitalWrite(PIN_LED_R, HIGH);
+  buzzerTone(2000); delay(150); buzzerTone(0); delay(200);
+}
+
+// =============================== LOOP ================================
+void loop() {
+  uint32_t now = millis();
+  static uint32_t tQ = 0, tF = 0, tM = 0, tB = 0, tP = 0;
+  if (haveAccel && now - tQ >= 20) { tQ = now; quakeTick(now); }
+  if (now - tF >= 50)   { tF = now; flameTick(now); }
+  if (now - tM >= 200)  { tM = now; mqTick(); }
+  if (now - tB >= 1000) { tB = now; bmeTick(now); }
+  buttonTick(now);
+  decide(now);
+  outputs(state, now);
+  if (now - tP >= 1000) {
+    tP = now;
+    Serial.printf("MQ=%d%s T=%.1fC(+%.1f) H=%.0f%% LUA=%d STA=%.3f => %s %s\n",
+                  mqRaw, now < MQ_WARMUP_MS ? "(warm-up)" : "", tempC, tempRise, hum, flameNow ? 1 : 0, sta,
+                  state == S_FIRE ? "!!! BAO DONG CHAY !!!" : state == S_QUAKE ? "BAO RUNG CHAN" : state == S_WARN ? "tien canh bao" : "binh thuong",
+                  why.c_str());
+  }
+}
